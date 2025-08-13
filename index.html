@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Scout — One-Button Live Talk</title>
+<style>
+  :root { --fg:#0e0e10; --bg:#fff; --muted:#6b7280; --accent:#0b57d0; }
+  html,body{height:100%;margin:0;background:var(--bg);color:var(--fg);font-family:system-ui,-apple-system,Segoe UI,Roboto,Arial}
+  .wrap{min-height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:20px;padding:20px}
+  h1{font-size:18px;margin:0}
+  .btn{width:min(520px,90vw);height:60px;border-radius:16px;background:var(--accent);color:#fff;border:0;font-size:18px}
+  .btn:active{transform:scale(.99)}
+  .chip{font-size:12px;padding:6px 10px;border-radius:999px;background:#eef2ff;color:#1e40af}
+  .muted{color:var(--muted);font-size:12px}
+  .log{width:min(620px,92vw);max-height:36vh;overflow:auto;border:1px solid #eee;border-radius:12px;padding:12px;font-size:14px;white-space:pre-wrap}
+</style>
+<body>
+  <div class="wrap">
+    <h1>Scout — One-Button Live Talk</h1>
+    <div class="chip" id="status">Tap Start</div>
+    <button class="btn" id="toggle">Start</button>
+    <div class="log" id="log" aria-live="polite"></div>
+    <div class="muted">Tip: Speak naturally. Scout answers after each pause. Works best with Wi-Fi, screen awake.</div>
+  </div>
+
+<script>
+(() => {
+  const els = {
+    status: document.getElementById('status'),
+    toggle: document.getElementById('toggle'),
+    log: document.getElementById('log'),
+  };
+  const log = (s) => els.log.textContent = (els.log.textContent + (els.log.textContent?'\n':'') + s).slice(-4000);
+  const setStatus = (s) => els.status.textContent = s;
+
+  let running = false, audioCtx, stream, source, processor, wakeLock;
+  let collecting = false, buffers = [], sampleRate = 48000;
+
+  // Basic VAD params (tuned for phones)
+  const RMS_THRESH = 0.015;     // speech starts above this (~-36 dBFS)
+  const MIN_TURN_MS = 600;      // minimum speech length to send
+  const SILENCE_TAIL_MS = 500;  // end turn after this much silence
+
+  let speaking = false; // prevent mic from hearing our TTS
+  function speak(text) {
+    try {
+      window.speechSynthesis.cancel();
+      const u = new SpeechSynthesisUtterance(String(text || ''));
+      u.rate = 1.0; u.pitch = 1.0; u.volume = 1.0;
+      speaking = true;
+      u.onend = () => { speaking = false; };
+      speechSynthesis.speak(u);
+    } catch {}
+  }
+
+  async function requestWakeLock() {
+    try {
+      if ('wakeLock' in navigator) {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => {});
+      }
+    } catch {}
+  }
+
+  function startCollect() { buffers = []; collecting = true; }
+  function stopCollect()  { collecting = false; }
+
+  function concatFloat32(chunks) {
+    let len = 0; for (const c of chunks) len += c.length;
+    const out = new Float32Array(len);
+    let o = 0; for (const c of chunks) { out.set(c, o); o += c.length; }
+    return out;
+  }
+
+  // Downsample 48k -> 16k and encode WAV (mono, 16-bit)
+  function floatToWav16k(float32, srcRate=48000) {
+    const target = 16000, ratio = srcRate / target;
+    const newLen = Math.floor(float32.length / ratio);
+    const pcm16 = new Int16Array(newLen);
+    for (let i=0,j=0; j<newLen; j++, i+=ratio) {
+      const s = Math.max(-1, Math.min(1, float32[Math.floor(i)] || 0));
+      pcm16[j] = s < 0 ? s * 0x8000 : s * 0x7FFF;
+    }
+    const header = 44, buf = new ArrayBuffer(header + pcm16.length*2);
+    const view = new DataView(buf);
+    let o=0; const w4=(x)=>{view.setUint32(o,x,true);o+=4}, w2=(x)=>{view.setUint16(o,x,true);o+=2}, w1s=(s)=>{for(let i=0;i<s.length;i++)view.setUint8(o++,s.charCodeAt(i));};
+    w1s('RIFF'); w4(36 + pcm16.length*2); w1s('WAVE'); w1s('fmt '); w4(16); w2(1); w2(1); w4(target); w4(target*2); w2(2); w2(16); w1s('data'); w4(pcm16.length*2);
+    new Uint8Array(buf, header).set(new Uint8Array(pcm16.buffer));
+    return new Blob([buf], { type:'audio/wav' });
+  }
+
+  async function sendTurn(float32) {
+    // Ignore if clearly too short (noise / accidental blip)
+    if (float32.length / sampleRate * 1000 < MIN_TURN_MS) return;
+    setStatus('Thinking…');
+    // Encode WAV -> base64
+    const wavBlob = floatToWav16k(float32, sampleRate);
+    const b64 = await new Promise(res => { const fr = new FileReader(); fr.onload=()=>res(fr.result.split(',')[1]); fr.readAsDataURL(wavBlob); });
+    try {
+      const r = await fetch('/.netlify/functions/ask', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ wavBase64: b64 })
+      });
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || r.statusText);
+      log('You: (turn)');
+      log('Scout: ' + (j.text||'(empty)'));
+      speak(j.text || '');
+    } catch (e) {
+      log('Error: ' + e.message);
+    } finally {
+      setStatus('Listening…');
+    }
+  }
+
+  function rms(frame) {
+    let s=0; for (let i=0;i<frame.length;i++) { const v=frame[i]; s += v*v; }
+    return Math.sqrt(s / frame.length);
+  }
+
+  function setupAudioGraph() {
+    source = audioCtx.createMediaStreamSource(stream);
+    processor = audioCtx.createScriptProcessor(2048, 1, 1);
+    let wasSpeech = false, speechStartTime = 0, lastSpeechMs = 0;
+
+    processor.onaudioprocess = (e) => {
+      if (!running || speaking) return; // don't collect while TTS speaks
+      const ch = e.inputBuffer.getChannelData(0);
+      const now = performance.now();
+      const level = rms(ch);
+
+      if (collecting) buffers.push(new Float32Array(ch)); // copy
+
+      if (!wasSpeech && level > RMS_THRESH) {
+        // speech starts
+        startCollect();
+        wasSpeech = true;
+        speechStartTime = now;
+      } else if (wasSpeech) {
+        if (level > RMS_THRESH) {
+          lastSpeechMs = now;
+        } else {
+          // silence; check tail
+          if (now - lastSpeechMs > SILENCE_TAIL_MS) {
+            // turn ended
+            stopCollect();
+            wasSpeech = false;
+            const turn = concatFloat32(buffers);
+            sendTurn(turn);
+          }
+        }
+      }
+    };
+
+    source.connect(processor);
+    // Route to destination muted to keep some iOS versions happy
+    processor.connect(audioCtx.destination);
+  }
+
+  async function startAll() {
+    if (running) return;
+    running = true;
+    setStatus('Starting…');
+    audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 48000 });
+    await audioCtx.resume();
+    stream = await navigator.mediaDevices.getUserMedia({ audio:{ echoCancellation:true, noiseSuppression:true }, video:false });
+    sampleRate = audioCtx.sampleRate || 48000;
+    await requestWakeLock();
+    setupAudioGraph();
+    setStatus('Listening…');
+    els.toggle.textContent = 'Stop';
+  }
+
+  function stopAll() {
+    running = false;
+    try { processor && processor.disconnect(); } catch {}
+    try { source && source.disconnect(); } catch {}
+    try { stream && stream.getTracks().forEach(t => t.stop()); } catch {}
+    try { wakeLock && wakeLock.release(); } catch {}
+    window.speechSynthesis.cancel();
+    setStatus('Tap Start');
+    els.toggle.textContent = 'Start';
+  }
+
+  els.toggle.addEventListener('click', async () => {
+    if (!running) {
+      try { await startAll(); } catch (e) { alert('Mic permission required.\n' + e.message); }
+    } else {
+      stopAll();
+    }
+  });
+})();
+</script>
+</body>
+</html>
